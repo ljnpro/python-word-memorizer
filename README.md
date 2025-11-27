@@ -12,10 +12,13 @@ npm install
 npm run electron      # 开发模式（3000 端口）
 npm run build         # 构建前端
 npm run build-mac     # 构建前端并打包 DMG（macOS，需允许 hdiutil）
+npm run build-win     # 构建前端并打包 Windows 安装包
 ```
 
-## 打包产物
-打包后 DMG 位于 `dist/`，示例：`LumenWords-0.3.0-arm64.dmg`。
+## 打包与发布
+- 打包后的 macOS DMG 位于 `dist/`，示例：`LumenWords-0.3.0-arm64.dmg`。
+- Windows 构建会生成 NSIS 安装包和便携版 EXE（`dist/LumenWords-*.exe`）。
+- GitHub Actions workflow `Build Windows Release` 会在推送 `v*` 标签或手动触发时自动构建 Windows 产物，并在有标签时附加到对应的 Release。
 
 ## 配置
 - Electron 主入口：`electron-main.js`
