@@ -22,6 +22,9 @@ mac:
     - target: dmg
       arch:
         - arm64
+    - target: pkg
+      arch:
+        - arm64
 win:
   target:
     - nsis
