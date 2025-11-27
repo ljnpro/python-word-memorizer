@@ -1,7 +1,12 @@
 {
-  "name": "my-mac-app",
-  "version": "0.1.0",
+  "name": "lumen-words",
+  "version": "0.3.0",
   "private": true,
+
+  "homepage": ".",
+
+  "main": "electron-main.js",
+
   "dependencies": {
     "@testing-library/dom": "^10.4.1",
     "@testing-library/jest-dom": "^6.9.1",
@@ -12,18 +17,28 @@
     "react-scripts": "5.0.1",
     "web-vitals": "^2.1.4"
   },
+
   "scripts": {
     "start": "react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
-    "eject": "react-scripts eject"
+    "eject": "react-scripts eject",
+
+    "electron": "electron .",
+    "build-mac": "react-scripts build && electron-builder --mac --config electron-builder.yml --publish never"
   },
+
+  "build": {
+    "extends": null
+  },
+
   "eslintConfig": {
     "extends": [
       "react-app",
       "react-app/jest"
     ]
   },
+
   "browserslist": {
     "production": [
       ">0.2%",
@@ -35,5 +50,10 @@
       "last 1 firefox version",
       "last 1 safari version"
     ]
+  },
+
+  "devDependencies": {
+    "electron": "^39.2.4",
+    "electron-builder": "^26.0.12"
   }
 }

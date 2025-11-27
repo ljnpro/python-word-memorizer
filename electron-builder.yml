@@ -1,0 +1,31 @@
+extends: null
+appId: com.lumen.words
+productName: LumenWords
+artifactName: "${productName}-${version}-${arch}.${ext}"
+asar: true
+files:
+  - build/**
+  - electron-main.js
+  - preload.js
+  - package.json
+extraMetadata:
+  main: electron-main.js
+directories:
+  output: dist
+  buildResources: assets
+mac:
+  category: public.app-category.utilities
+  target:
+    - target: dmg
+      arch:
+        - arm64
+electronDist: node_modules/electron/dist
+electronVersion: 39.2.4
+npmRebuild: false
+publish: null
+dmg:
+  sign: false
+  writeUpdateInfo: false
+  window:
+    width: 540
+    height: 380
