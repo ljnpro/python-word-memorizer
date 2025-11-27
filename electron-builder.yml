@@ -10,6 +10,9 @@ files:
   - package.json
 extraMetadata:
   main: electron-main.js
+extraResources:
+  - from: scripts/reset-quarantine.sh
+    to: reset-quarantine.sh
 directories:
   output: dist
   buildResources: assets
