@@ -15,10 +15,14 @@ const COMMON_WORDS = new Set([
 
 const REQUEST_TIMEOUT = 9000;
 const QUIZ_SIZE = 7;
+const TODAY = () => new Date().toISOString().slice(0, 10);
+const REVIEW_STEPS = [1, 3, 7, 14];
 
 const STORAGE_KEYS = {
   counts: 'word_search_counts',
-  wordbook: 'wordbook_entries_v2'
+  wordbook: 'wordbook_entries_v3',
+  dailyGoal: 'daily_goal',
+  missed: 'missed_words'
 };
 
 const normalize = (text) => text.trim().toLowerCase();
@@ -27,9 +31,9 @@ const fetchWithTimeout = async (url, options = {}) => {
   const { timeout = REQUEST_TIMEOUT, signal, ...rest } = options;
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(new DOMException('Request timed out', 'AbortError')), timeout);
-
   const abortListener =
     signal && (() => controller.abort(signal.reason || new DOMException('Request aborted', 'AbortError')));
+
   if (signal && abortListener) {
     signal.addEventListener('abort', abortListener);
   }
@@ -71,7 +75,8 @@ const ensureStats = (stats = {}) => ({
   tests: stats.tests || 0,
   correct: stats.correct || 0,
   streak: stats.streak || 0,
-  lastTested: stats.lastTested || 0
+  lastTested: stats.lastTested || 0,
+  nextReview: stats.nextReview || 0
 });
 
 const migrateWordbook = (entries = []) =>
@@ -86,6 +91,7 @@ const migrateWordbook = (entries = []) =>
         addedAt: item.addedAt || Date.now(),
         source: item.source || '自动收藏',
         note: item.note || '',
+        tags: Array.isArray(item.tags) ? item.tags : [],
         stats: ensureStats(item.stats)
       };
     })
@@ -101,6 +107,19 @@ const shuffle = (arr) => {
 };
 
 const cleanDefinition = (text = '') => text.replace(/\s+/g, ' ').trim();
+
+const hydrateDailyGoal = (saved) => {
+  const fallback = { target: 15, completed: 0, date: TODAY() };
+  if (!saved) return fallback;
+  if (saved.date !== TODAY()) {
+    return { ...fallback, target: saved.target || fallback.target };
+  }
+  return {
+    target: saved.target || fallback.target,
+    completed: saved.completed || 0,
+    date: TODAY()
+  };
+};
 
 function App() {
   const [text, setText] = useState('');
@@ -123,6 +142,17 @@ function App() {
   });
   const [quizError, setQuizError] = useState('');
   const [hydrated, setHydrated] = useState(false);
+  const [dailyGoal, setDailyGoal] = useState(() => hydrateDailyGoal(loadFromStorage(STORAGE_KEYS.dailyGoal)));
+  const [missedWords, setMissedWords] = useState(() => loadFromStorage(STORAGE_KEYS.missed, []));
+  const [flashState, setFlashState] = useState({ queue: [], index: 0, reveal: false });
+  const [manualWord, setManualWord] = useState('');
+  const [manualDefinition, setManualDefinition] = useState('');
+  const [manualTags, setManualTags] = useState('');
+  const [filterText, setFilterText] = useState('');
+  const [filterTag, setFilterTag] = useState('');
+  const [exportData, setExportData] = useState('');
+  const [importText, setImportText] = useState('');
+  const [toast, setToast] = useState('');
 
   const cacheRef = useRef({ definitions: {}, translations: {} });
   const requestControllerRef = useRef(null);
@@ -133,10 +163,28 @@ function App() {
     return /\s/.test(trimmed);
   }, [text]);
 
+  const dailyProgress = useMemo(() => {
+    const safeTarget = Math.max(dailyGoal.target || 1, 1);
+    return Math.min(100, Math.round((dailyGoal.completed / safeTarget) * 100));
+  }, [dailyGoal]);
+
   const reviewList = useMemo(() => {
-    const sorted = [...wordbook].sort((a, b) => (a.stats.lastTested || 0) - (b.stats.lastTested || 0));
-    return sorted.slice(0, 6);
+    const sorted = [...wordbook].sort((a, b) => (a.stats.nextReview || 0) - (b.stats.nextReview || 0));
+    return sorted.slice(0, 8);
   }, [wordbook]);
+
+  const filteredWordbook = useMemo(() => {
+    const ft = filterText.trim().toLowerCase();
+    return wordbook.filter((item) => {
+      const matchText =
+        !ft ||
+        item.word.toLowerCase().includes(ft) ||
+        (item.definition || '').toLowerCase().includes(ft) ||
+        (item.note || '').toLowerCase().includes(ft);
+      const matchTag = !filterTag || (item.tags || []).includes(filterTag);
+      return matchText && matchTag;
+    });
+  }, [wordbook, filterText, filterTag]);
 
   useEffect(() => {
     let cancelled = false;
@@ -147,6 +195,8 @@ function App() {
           if (cancelled) return;
           if (data?.wordbook) setWordbook(migrateWordbook(data.wordbook));
           if (data?.searchCounts) setSearchCounts(data.searchCounts);
+          if (data?.dailyGoal) setDailyGoal(hydrateDailyGoal(data.dailyGoal));
+          if (data?.missedWords) setMissedWords(Array.isArray(data.missedWords) ? data.missedWords : []);
         }
       } catch (err) {
         console.warn('读取本地进度失败，将使用浏览器存储', err);
@@ -162,17 +212,34 @@ function App() {
 
   useEffect(() => {
     if (!hydrated) return;
-    const payload = { wordbook, searchCounts };
+    const payload = { wordbook, searchCounts, dailyGoal, missedWords };
     if (window.persist?.saveData) {
       window.persist.saveData(payload).catch((err) => console.warn('写入本地进度失败', err));
     }
     try {
       window.localStorage.setItem(STORAGE_KEYS.wordbook, JSON.stringify(wordbook));
       window.localStorage.setItem(STORAGE_KEYS.counts, JSON.stringify(searchCounts));
+      window.localStorage.setItem(STORAGE_KEYS.dailyGoal, JSON.stringify(dailyGoal));
+      window.localStorage.setItem(STORAGE_KEYS.missed, JSON.stringify(missedWords));
     } catch (err) {
       console.warn('写入 localStorage 失败', err);
     }
-  }, [wordbook, searchCounts, hydrated]);
+  }, [wordbook, searchCounts, dailyGoal, missedWords, hydrated]);
+
+  useEffect(() => {
+    const queue = buildFlashQueue(wordbook);
+    setFlashState((prev) => ({
+      queue,
+      index: 0,
+      reveal: false
+    }));
+  }, [wordbook]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const timer = setTimeout(() => setToast(''), 2000);
+    return () => clearTimeout(timer);
+  }, [toast]);
 
   const handleSubmit = async (e) => {
     e.preventDefault();
@@ -231,6 +298,7 @@ function App() {
         phonetic: result.definitions[0]?.phonetic,
         source: '自动收藏'
       });
+      incrementDailyGoal(1);
     }
   };
 
@@ -244,6 +312,7 @@ function App() {
         definition: translated || '已添加到单词本（句子）',
         source: '句子收藏'
       });
+      incrementDailyGoal(1);
     }
   };
 
@@ -338,6 +407,7 @@ function App() {
         addedAt: existing?.addedAt || Date.now(),
         source: payload.source || existing?.source || '单词收藏',
         note: payload.note || existing?.note || '',
+        tags: Array.isArray(payload.tags) ? payload.tags : existing?.tags || [],
         stats: ensureStats(existing?.stats)
       };
 
@@ -397,12 +467,16 @@ function App() {
       prev.map((item) => {
         if (item.word !== word) return item;
         const stats = ensureStats(item.stats);
+        const nextStreak = isCorrect ? stats.streak + 1 : 0;
+        const step = Math.min(REVIEW_STEPS[nextStreak] || REVIEW_STEPS[REVIEW_STEPS.length - 1], 21);
+        const nextReview = Date.now() + step * 24 * 60 * 60 * 1000;
         const updatedStats = {
           ...stats,
           tests: stats.tests + 1,
           correct: stats.correct + (isCorrect ? 1 : 0),
-          streak: isCorrect ? stats.streak + 1 : 0,
-          lastTested: Date.now()
+          streak: nextStreak,
+          lastTested: Date.now(),
+          nextReview
         };
         return { ...item, stats: updatedStats };
       })
@@ -433,6 +507,17 @@ function App() {
     });
   };
 
+  const incrementDailyGoal = (step = 1) => {
+    setDailyGoal((prev) => {
+      const today = TODAY();
+      if (prev.date !== today) {
+        return { target: prev.target || 15, completed: Math.min(step, prev.target || 15), date: today };
+      }
+      const nextCompleted = Math.min((prev.completed || 0) + step, prev.target || 15);
+      return { ...prev, completed: nextCompleted };
+    });
+  };
+
   const startQuiz = () => {
     const questions = buildQuizQuestions();
     if (!questions.length) {
@@ -454,6 +539,15 @@ function App() {
       const currentQuestion = prev.questions[prev.current];
       const isCorrect = option === currentQuestion.correct;
       recordTestResult(currentQuestion.word, isCorrect);
+
+      setMissedWords((missed) => {
+        const exists = missed.includes(currentQuestion.word);
+        if (!isCorrect && !exists) return [...missed, currentQuestion.word];
+        if (isCorrect && exists) return missed.filter((w) => w !== currentQuestion.word);
+        return missed;
+      });
+
+      if (isCorrect) incrementDailyGoal(1);
 
       const nextIndex = prev.current + 1;
       const finished = nextIndex >= prev.questions.length;
@@ -477,13 +571,158 @@ function App() {
     setQuizError('');
   };
 
+  const startMissedQuiz = () => {
+    if (!missedWords.length) {
+      setQuizError('暂时没有错题可复习。');
+      return;
+    }
+    const candidates = wordbook.filter((item) => missedWords.includes(item.word));
+    if (!candidates.length) {
+      setQuizError('错题未在当前单词本中，先补充释义。');
+      return;
+    }
+    const questions = candidates.map((item) => ({
+      word: item.word,
+      phonetic: item.phonetic,
+      correct: cleanDefinition(item.definition) || '已收藏',
+      options: shuffle([
+        cleanDefinition(item.definition) || '已收藏',
+        '关注发音和搭配，多读几遍。',
+        '试着造句并背诵。',
+        '想想它的同义词或反义词。'
+      ])
+    }));
+    setQuizError('');
+    setQuizState({
+      active: true,
+      finished: false,
+      current: 0,
+      score: 0,
+      questions
+    });
+  };
+
+  const buildFlashQueue = (items) => {
+    const sorted = [...items].sort((a, b) => {
+      const streakA = a.stats?.streak || 0;
+      const streakB = b.stats?.streak || 0;
+      if (streakA === streakB) {
+        return (a.stats.nextReview || 0) - (b.stats.nextReview || 0);
+      }
+      return streakA - streakB;
+    });
+    return shuffle(sorted).slice(0, Math.min(14, sorted.length));
+  };
+
+  const handleFlashReveal = () => {
+    setFlashState((prev) => ({ ...prev, reveal: !prev.reveal }));
+  };
+
+  const handleFlashNext = () => {
+    setFlashState((prev) => {
+      if (!prev.queue.length) return prev;
+      return {
+        ...prev,
+        index: (prev.index + 1) % prev.queue.length,
+        reveal: false
+      };
+    });
+  };
+
+  const handleManualAdd = () => {
+    if (!manualWord.trim()) return;
+    const tags = manualTags
+      .split(/[,，;]/)
+      .map((t) => t.trim())
+      .filter(Boolean);
+    addToWordbook(manualWord, {
+      definition: manualDefinition || '已收藏（手动）',
+      source: '手动添加',
+      tags
+    });
+    incrementDailyGoal(1);
+    setManualWord('');
+    setManualDefinition('');
+    setManualTags('');
+    setToast('已添加到单词本');
+  };
+
+  const handleExport = () => {
+    try {
+      const data = JSON.stringify(wordbook, null, 2);
+      setExportData(data);
+      navigator.clipboard?.writeText(data).catch(() => {});
+      setToast('已生成导出数据');
+    } catch (err) {
+      console.warn('导出失败', err);
+    }
+  };
+
+  const handleImport = () => {
+    if (!importText.trim()) return;
+    try {
+      const parsed = JSON.parse(importText);
+      if (!Array.isArray(parsed)) throw new Error('格式需为数组');
+      const migrated = migrateWordbook(parsed);
+      setWordbook((prev) => {
+        const merged = [...prev];
+        migrated.forEach((item) => {
+          const existing = merged.find((m) => m.word === item.word);
+          if (existing) {
+            merged.splice(
+              merged.findIndex((m) => m.word === item.word),
+              1,
+              { ...existing, ...item }
+            );
+          } else {
+            merged.push(item);
+          }
+        });
+        return merged;
+      });
+      setImportText('');
+      setToast('导入成功');
+    } catch (err) {
+      setToast('导入失败，请检查 JSON 格式');
+    }
+  };
+
+  const toggleTag = (word, tag) => {
+    setWordbook((prev) =>
+      prev.map((item) => {
+        if (item.word !== word) return item;
+        const tags = new Set(item.tags || []);
+        if (tags.has(tag)) {
+          tags.delete(tag);
+        } else {
+          tags.add(tag);
+        }
+        return { ...item, tags: Array.from(tags) };
+      })
+    );
+  };
+
   const hotSearch = (() => {
     const normalizedWord = normalize(text);
     return (searchCounts[normalizedWord] || 0) >= 3;
   })();
 
+  const currentFlash = flashState.queue[flashState.index];
+
+  const quizProgress = quizState.questions.length
+    ? Math.round(
+        ((quizState.finished ? quizState.questions.length : quizState.current) / quizState.questions.length) * 100
+      )
+    : 0;
+
+  const tagsSet = useMemo(() => {
+    const set = new Set();
+    wordbook.forEach((w) => (w.tags || []).forEach((t) => set.add(t)));
+    return Array.from(set);
+  }, [wordbook]);
+
   const renderDefinition = (entry) => (
-    <div className="card" key={entry.word}>
+    <div className="card fade-in" key={entry.word}>
       <div className="card-header">
         <div className="word-head">
           <span className="word">{entry.word}</span>
@@ -511,23 +750,37 @@ function App() {
     </div>
   );
 
-  const quizProgress = quizState.questions.length
-    ? Math.round(((quizState.finished ? quizState.questions.length : quizState.current) /
-        quizState.questions.length) *
-        100)
-    : 0;
-
   return (
     <div className="page">
       <header className="hero">
         <div>
-          <p className="eyebrow">LumenWords · 词典 / 记忆 / 测试</p>
-          <h1>光谱词库</h1>
+          <p className="eyebrow">LumenWords · 词典 / 记忆 / 测验 / 闪卡 / 导入导出</p>
+          <h1 className="title-glow">光谱词库 v1.0</h1>
           <p className="subtitle">
-            查询释义、翻译句子、批量导入单词，并用测验巩固记忆。所有功能均为中文界面，适合自学与复盘。
+            查询释义、翻译句子、批量导入单词，支持闪卡、测验、错题重练、标记标签与导入导出。无需 API Key，数据自动持久化。
           </p>
+          <div className="daily">
+            <div className="daily-head">
+              <span>今日目标 {dailyGoal.completed}/{dailyGoal.target}</span>
+              <div className="chips">
+                <button className="ghost tiny" onClick={() => setDailyGoal(hydrateDailyGoal({ target: dailyGoal.target }))}>
+                  重置今日
+                </button>
+                <button
+                  className="ghost tiny"
+                  onClick={() => setDailyGoal((p) => ({ ...p, target: Math.max(5, (p.target || 15) + 5), date: TODAY() }))}
+                >
+                  提升目标
+                </button>
+              </div>
+            </div>
+            <div className="progress animated">
+              <div className="bar" style={{ width: `${dailyProgress}%` }} />
+              <span>完成度 {dailyProgress}%</span>
+            </div>
+          </div>
         </div>
-        <div className="badge">桌面记单词</div>
+        <div className="badge pop">桌面记单词</div>
       </header>
 
       <main className="content">
@@ -575,14 +828,14 @@ function App() {
               </div>
               {isSentence ? (
                 <>
-                  <div className="card">
+                  <div className="card fade-in">
                     <div className="card-body">
                       <div className="label">翻译</div>
                       <div className="definition-text">{translation || '等待翻译结果…'}</div>
                     </div>
                   </div>
 
-                  <div className="card">
+                  <div className="card fade-in">
                     <div className="card-body">
                       <div className="label">低频词解析</div>
                       {rareWords.length === 0 ? (
@@ -617,7 +870,7 @@ function App() {
         <section className="panel">
           <div className="panel-head">
             <div>
-              <div className="tag">批量导入</div>
+              <div className="tag">批量导入 & 手动收藏</div>
               <h3>一键收录多个单词</h3>
               <p className="muted">换行或逗号分隔；自动抓取释义并加入单词本。</p>
             </div>
@@ -637,6 +890,32 @@ function App() {
               {batchStatus.message} {batchStatus.processed}/{batchStatus.total}
             </div>
           ) : null}
+          <div className="manual">
+            <div>
+              <div className="tag">手动收藏</div>
+              <p className="muted">快速添加词条与标签，补充释义可留空。</p>
+            </div>
+            <div className="manual-form">
+              <input
+                value={manualWord}
+                onChange={(e) => setManualWord(e.target.value)}
+                placeholder="单词"
+              />
+              <input
+                value={manualDefinition}
+                onChange={(e) => setManualDefinition(e.target.value)}
+                placeholder="自定义释义（可选）"
+              />
+              <input
+                value={manualTags}
+                onChange={(e) => setManualTags(e.target.value)}
+                placeholder="标签（逗号分隔，可选）"
+              />
+              <button className="ghost" onClick={handleManualAdd}>
+                添加
+              </button>
+            </div>
+          </div>
         </section>
 
         <section className="panel">
@@ -650,15 +929,30 @@ function App() {
               已收录 <strong>{wordbook.length}</strong> 个词
             </div>
           </div>
-          {wordbook.length === 0 ? (
+          <div className="filters">
+            <input
+              placeholder="按词/释义/笔记搜索"
+              value={filterText}
+              onChange={(e) => setFilterText(e.target.value)}
+            />
+            <select value={filterTag} onChange={(e) => setFilterTag(e.target.value)}>
+              <option value="">全部标签</option>
+              {tagsSet.map((tag) => (
+                <option key={tag} value={tag}>
+                  {tag}
+                </option>
+              ))}
+            </select>
+          </div>
+          {filteredWordbook.length === 0 ? (
             <div className="placeholder">还没有收藏的词语，先查询或批量导入吧。</div>
           ) : (
             <div className="wordbook">
-              {wordbook
+              {filteredWordbook
                 .slice()
                 .reverse()
                 .map((item) => (
-                  <div className="wordbook-item" key={`${item.word}-${item.addedAt}`}>
+                  <div className="wordbook-item fade-in" key={`${item.word}-${item.addedAt}`}>
                     <div className="wordbook-title">
                       <div className="word-line">
                         <span className="word">{item.word}</span>
@@ -672,9 +966,25 @@ function App() {
                     <div className="meta-row">
                       <span className="meta">来源：{item.source}</span>
                       <span className="meta">
-                        测试正确率：{item.stats.tests ? Math.round((item.stats.correct / item.stats.tests) * 100) : 0}%
+                        正确率：{item.stats.tests ? Math.round((item.stats.correct / item.stats.tests) * 100) : 0}%
                       </span>
                       <span className="meta">连对：{item.stats.streak}</span>
+                      <span className="meta">
+                        下次复习：{item.stats.nextReview ? new Date(item.stats.nextReview).toLocaleDateString('zh-CN') : '待安排'}
+                      </span>
+                    </div>
+                    <div className="chips">
+                      {(item.tags || []).map((tag) => (
+                        <span className="chip" key={tag} onClick={() => setFilterTag(tag)}>
+                          #{tag}
+                        </span>
+                      ))}
+                      <button className="ghost tiny" onClick={() => toggleTag(item.word, '常考')}>
+                        常考
+                      </button>
+                      <button className="ghost tiny" onClick={() => toggleTag(item.word, '易错')}>
+                        易错
+                      </button>
                     </div>
                   </div>
                 ))}
@@ -686,37 +996,51 @@ function App() {
           <div className="panel sub">
             <div className="panel-head">
               <div>
-                <div className="tag">复习清单</div>
-                <h3>今日优先</h3>
-                <p className="muted">按最近测试时间排序，优先复习冷却中的词。</p>
+                <div className="tag">闪卡复习</div>
+                <h3>翻转记忆</h3>
+                <p className="muted">优先出现低连对、久未测试的词，点击翻转释义。</p>
               </div>
+              <button
+                className="ghost"
+                onClick={() => setFlashState({ queue: buildFlashQueue(wordbook), index: 0, reveal: false })}
+              >
+                重新生成
+              </button>
             </div>
-            {reviewList.length === 0 ? (
-              <div className="placeholder">添加一些词后，这里会出现待复习清单。</div>
+            {!flashState.queue.length ? (
+              <div className="placeholder">添加一些词后，自动生成闪卡队列。</div>
             ) : (
-              <ul className="review-list">
-                {reviewList.map((item) => (
-                  <li key={item.word} className="review-item">
-                    <div>
-                      <div className="word-line">
-                        <span className="word">{item.word}</span>
-                        {item.phonetic ? <span className="phonetic">[{item.phonetic}]</span> : null}
-                      </div>
-                      <div className="definition-text small">{item.definition}</div>
+              <div className="flashcard animate-pop" onClick={handleFlashReveal}>
+                <div className={`flash-inner ${flashState.reveal ? 'reveal' : ''}`}>
+                  <div className="flash-face front">
+                    <div className="label">词面</div>
+                    <h4>
+                      {currentFlash?.word}
+                      {currentFlash?.phonetic ? <span className="phonetic">[{currentFlash.phonetic}]</span> : null}
+                    </h4>
+                    <div className="meta">连对 {currentFlash?.stats?.streak || 0}</div>
+                  </div>
+                  <div className="flash-face back">
+                    <div className="label">释义</div>
+                    <div className="definition-text">{currentFlash?.definition || '点击翻面'}</div>
+                    <div className="meta">
+                      下次复习：
+                      {currentFlash?.stats?.nextReview
+                        ? new Date(currentFlash.stats.nextReview).toLocaleDateString('zh-CN')
+                        : '待安排'}
                     </div>
-                    <div className="meta-col">
-                      <span className="meta">
-                        最近测试：
-                        {item.stats.lastTested
-                          ? new Date(item.stats.lastTested).toLocaleDateString('zh-CN')
-                          : '未测试'}
-                      </span>
-                      <span className="meta">连对 {item.stats.streak}</span>
-                    </div>
-                  </li>
-                ))}
-              </ul>
+                  </div>
+                </div>
+              </div>
             )}
+            <div className="flash-actions">
+              <button className="ghost" onClick={handleFlashReveal}>
+                翻转
+              </button>
+              <button className="ghost" onClick={handleFlashNext}>
+                下一个
+              </button>
+            </div>
           </div>
 
           <div className="panel sub">
@@ -733,6 +1057,9 @@ function App() {
                 <button className="ghost" onClick={resetQuiz}>
                   重置
                 </button>
+                <button className="ghost" onClick={startMissedQuiz}>
+                  错题重测
+                </button>
               </div>
             </div>
             {quizError ? <div className="hint error">{quizError}</div> : null}
@@ -742,7 +1069,7 @@ function App() {
 
             {quizState.active && quizState.questions.length ? (
               <div className="quiz">
-                <div className="progress">
+                <div className="progress animated">
                   <div className="bar" style={{ width: `${quizProgress}%` }} />
                   <span>
                     进度 {quizState.finished ? quizState.questions.length : quizState.current}/{quizState.questions.length} ·
@@ -751,7 +1078,7 @@ function App() {
                 </div>
                 {!quizState.finished ? (
                   <>
-                    <div className="quiz-card">
+                    <div className="quiz-card fade-in">
                       <div className="label">选择正确释义</div>
                       <h4>
                         {quizState.questions[quizState.current].word}
@@ -781,7 +1108,107 @@ function App() {
             ) : null}
           </div>
         </section>
+
+        <section className="panel section-grid">
+          <div className="panel sub">
+            <div className="panel-head">
+              <div>
+                <div className="tag">复习清单</div>
+                <h3>今日优先</h3>
+                <p className="muted">按下次复习时间排序，优先复习冷却中的词。</p>
+              </div>
+            </div>
+            {reviewList.length === 0 ? (
+              <div className="placeholder">添加一些词后，这里会出现待复习清单。</div>
+            ) : (
+              <ul className="review-list">
+                {reviewList.map((item) => (
+                  <li key={item.word} className="review-item fade-in">
+                    <div>
+                      <div className="word-line">
+                        <span className="word">{item.word}</span>
+                        {item.phonetic ? <span className="phonetic">[{item.phonetic}]</span> : null}
+                      </div>
+                      <div className="definition-text small">{item.definition}</div>
+                    </div>
+                    <div className="meta-col">
+                      <span className="meta">
+                        下次复习：
+                        {item.stats.nextReview
+                          ? new Date(item.stats.nextReview).toLocaleDateString('zh-CN')
+                          : '待安排'}
+                      </span>
+                      <span className="meta">连对 {item.stats.streak}</span>
+                    </div>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div className="panel sub">
+            <div className="panel-head">
+              <div>
+                <div className="tag">错题再练</div>
+                <h3>优先攻克短板</h3>
+                <p className="muted">错题列表会随测验更新，可直接点击再次测验。</p>
+              </div>
+            </div>
+            {missedWords.length === 0 ? (
+              <div className="placeholder">暂无错题，继续保持！</div>
+            ) : (
+              <div className="missed-grid">
+                {missedWords.map((word) => (
+                  <div className="missed-card fade-in" key={word}>
+                    <div className="word-line">
+                      <span className="word">{word}</span>
+                      <button className="ghost tiny" onClick={() => setText(word)}>
+                        填入查询
+                      </button>
+                    </div>
+                    <button className="ghost tiny" onClick={startMissedQuiz}>
+                      立即重测
+                    </button>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="panel sub">
+            <div className="panel-head">
+              <div>
+                <div className="tag">导入导出</div>
+                <h3>备份 / 迁移</h3>
+                <p className="muted">JSON 格式导入导出，支持跨设备迁移。</p>
+              </div>
+              <div className="chips">
+                <button className="ghost tiny" onClick={handleExport}>
+                  生成导出
+                </button>
+                <button className="ghost tiny" onClick={handleImport}>
+                  导入
+                </button>
+              </div>
+            </div>
+            <textarea
+              className="batch-textarea"
+              value={exportData}
+              onChange={(e) => setExportData(e.target.value)}
+              placeholder="点击生成导出数据，自动复制到剪贴板"
+              rows={3}
+            />
+            <textarea
+              className="batch-textarea"
+              value={importText}
+              onChange={(e) => setImportText(e.target.value)}
+              placeholder="粘贴要导入的 JSON 数组"
+              rows={3}
+            />
+          </div>
+        </section>
       </main>
+      {toast ? <div className="toast">{toast}</div> : null}
     </div>
   );
 }
