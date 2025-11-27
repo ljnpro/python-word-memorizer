@@ -19,6 +19,16 @@ mac:
     - target: dmg
       arch:
         - arm64
+win:
+  target:
+    - nsis
+    - portable
+  artifactName: "${productName}-${version}-${arch}.${ext}"
+  icon: assets/icon.ico
+nsis:
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
 electronDist: node_modules/electron/dist
 electronVersion: 39.2.4
 npmRebuild: false
