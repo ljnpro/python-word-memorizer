@@ -11,8 +11,8 @@ files:
 extraMetadata:
   main: electron-main.js
 extraResources:
-  - from: scripts/reset-quarantine.sh
-    to: reset-quarantine.sh
+  - from: scripts
+    to: scripts
 directories:
   output: dist
   buildResources: assets
