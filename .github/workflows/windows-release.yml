@@ -6,6 +6,9 @@ on:
     tags:
       - 'v*'
 
+permissions:
+  contents: write
+
 jobs:
   build:
     name: Build Windows installer
@@ -14,6 +17,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.WINDOWS_RELEASE_PAT || github.token }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -44,4 +49,4 @@ jobs:
             dist/LumenWords-*.exe
             dist/LumenWords-*.portable.exe
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITHUB_TOKEN: ${{ secrets.WINDOWS_RELEASE_PAT || github.token }}
